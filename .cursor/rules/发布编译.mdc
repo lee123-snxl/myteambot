@@ -1,0 +1,20 @@
+---
+description: 做完一项功能后必须跑发布编译，生成 dist\LocalBot.exe
+alwaysApply: true
+---
+
+# 发布编译
+
+做完一项功能后，同一轮里跑发布编译，再告诉用户结果。测试通过之后还要发布编译。
+
+在仓库根目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+```
+
+脚本会先跑测试，再发布编译，并把 exe 复制到 `dist\LocalBot.exe`。链接走 `scripts\cargo-msvc.bat`，不要直接调用没有 Visual Studio 环境的 `cargo`。
+
+编译失败就先改到通过。回答里说明 `dist\LocalBot.exe` 已生成。
+
+没有改代码、只回答问题时不用编译。
