@@ -1,7 +1,10 @@
+mod explorer;
+mod shell;
+
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bots::{self, Bot};
 use crate::chat::{self, Message};
@@ -12,19 +15,15 @@ use crate::media::{self, Outcome};
 use crate::providers::{self, Provider, TestReport};
 use crate::store::Store;
 use crate::usage;
-
-const USER_BUBBLE: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(24, 24, 27);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(113, 113, 122);
-const LINE: egui::Color32 = egui::Color32::from_rgb(228, 228, 231);
-const DANGER: egui::Color32 = egui::Color32::from_rgb(153, 27, 27);
-const OK: egui::Color32 = egui::Color32::from_rgb(22, 101, 52);
-const WARN: egui::Color32 = egui::Color32::from_rgb(161, 98, 7);
+use shell::{
+    bar_action, danger_button, group_title, note, page, primary_button, tab_label, tab_strip, Activity, Tab, TabEvent,
+    ACCENT, BORDER, BRIGHT, CARD, DANGER, EDITOR_BG, ERROR_BG, INPUT_BG, INPUT_BORDER, MUTED, TEXT, USER_BUBBLE, WARN,
+};
 
 pub fn launch() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 740.0])
+            .with_inner_size([1200.0, 780.0])
             .with_min_inner_size([900.0, 620.0])
             .with_title("本机 Bot"),
         ..Default::default()
@@ -33,7 +32,7 @@ pub fn launch() -> eframe::Result<()> {
         "本机 Bot",
         options,
         Box::new(|cc| {
-            install_style(&cc.egui_ctx);
+            shell::install_style(&cc.egui_ctx);
             let font_error = install_cjk(&cc.egui_ctx).err();
             let mut app = App::new();
             if let Some(err) = font_error {
@@ -42,16 +41,6 @@ pub fn launch() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
-}
-
-fn install_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::light();
-    style.visuals.panel_fill = egui::Color32::WHITE;
-    style.visuals.window_fill = egui::Color32::from_rgb(250, 250, 250);
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    ctx.set_style(style);
 }
 
 fn install_cjk(ctx: &egui::Context) -> Result<(), String> {
@@ -82,6 +71,15 @@ enum Panel {
     Bot,
     Chat,
     Group,
+}
+
+/// 编辑区的标签：主页面（对话或表单）、群组设置、文件夹预览、群组文件预览。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Main,
+    Settings,
+    Browse,
+    Attach,
 }
 
 enum Nav {
@@ -128,6 +126,9 @@ struct App {
     providers: Vec<Provider>,
     bots: Vec<Bot>,
     panel: Panel,
+    view: View,
+    activity: Activity,
+    side_open: bool,
     provider_form: Provider,
     provider_base: Provider,
     bot_form: Bot,
@@ -156,6 +157,7 @@ struct App {
     input: String,
     notice: String,
     notice_ok: bool,
+    notice_at: Instant,
     models: Vec<String>,
     textures: HashMap<String, egui::TextureHandle>,
     job: Option<Job>,
@@ -208,6 +210,9 @@ impl App {
             providers,
             bots,
             panel: Panel::Home,
+            view: View::Main,
+            activity: Activity::Talk,
+            side_open: true,
             provider_base: provider_form.clone(),
             provider_form,
             bot_base: bot_form.clone(),
@@ -236,6 +241,7 @@ impl App {
             input: String::new(),
             notice,
             notice_ok: false,
+            notice_at: Instant::now(),
             models: Vec::new(),
             textures: HashMap::new(),
             job: None,
@@ -246,22 +252,31 @@ impl App {
 
     fn update_frame(&mut self, ctx: &egui::Context) {
         self.poll(ctx);
-        self.sidebar(ctx);
-        if self.panel == Panel::Group && !self.group_id.is_empty() {
-            self.files_panel(ctx);
-        } else if self.panel == Panel::Chat && self.chat_folder().is_some() {
-            self.chat_folder_panel(ctx);
+        self.fix_view();
+        self.status_bar(ctx);
+        self.activity_bar(ctx);
+        if self.side_open {
+            self.side_bar(ctx);
         }
-        if (self.panel == Panel::Chat && !self.chat_id.is_empty()) || (self.panel == Panel::Group && !self.group_id.is_empty()) {
-            self.composer(ctx);
-        }
-        let frame = egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(250, 250, 250))
-            .inner_margin(16.0);
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            self.main_view(ui);
+        let talking = self.view == View::Main
+            && ((self.panel == Panel::Chat && !self.chat_id.is_empty()) || self.in_group());
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(EDITOR_BG)).show(ctx, |ui| {
+            self.editor(ui, talking);
         });
+        self.notification(ctx, talking);
         self.confirm_dialog(ctx);
+    }
+
+    fn fix_view(&mut self) {
+        let valid = match self.view {
+            View::Main => true,
+            View::Settings => self.in_group(),
+            View::Browse => matches!(self.panel, Panel::Chat | Panel::Group) && !self.browse_file.is_empty(),
+            View::Attach => self.in_group() && !self.preview_id.is_empty(),
+        };
+        if !valid {
+            self.view = View::Main;
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -436,137 +451,141 @@ impl App {
         Ok(())
     }
 
-    fn sidebar(&mut self, ctx: &egui::Context) {
-        let providers = self
-            .providers
-            .iter()
-            .map(|item| (item.id.clone(), item.name.clone()))
-            .collect::<Vec<_>>();
-        let bots = self
-            .bots
-            .iter()
-            .map(|item| (item.id.clone(), item.name.clone()))
-            .collect::<Vec<_>>();
-        let current_provider = if self.panel == Panel::Provider {
-            self.provider_form.id.clone()
-        } else {
-            String::new()
-        };
-        let current_bot = if self.panel == Panel::Bot {
-            self.bot_form.id.clone()
-        } else {
-            String::new()
-        };
-        let current_chat = if self.panel == Panel::Chat {
-            self.chat_id.clone()
-        } else {
-            String::new()
-        };
-        let groups = self
-            .groups
-            .iter()
-            .map(|item| (item.id.clone(), item.name.clone()))
-            .collect::<Vec<_>>();
-        let current_group = if self.panel == Panel::Group {
-            self.group_id.clone()
-        } else {
-            String::new()
-        };
-        let data_dir = self.data_dir.clone();
-        let frame = egui::Frame::NONE.fill(egui::Color32::WHITE).inner_margin(12.0);
-        egui::SidePanel::left("sidebar")
-            .exact_width(272.0)
-            .resizable(false)
-            .frame(frame)
-            .show(ctx, |ui| {
-                ui.heading("本机 Bot");
-                ui.label(egui::RichText::new("即开即用，只保存在这台电脑上").size(12.0).color(MUTED));
-                ui.add_space(6.0);
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.label(egui::RichText::new(data_dir).size(11.0).color(MUTED));
-                    ui.label(egui::RichText::new("数据目录").size(11.0).color(MUTED));
-                    ui.separator();
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            section_title(ui, "模型提供方", "添加", || Nav::NewProvider, self);
-                            for (id, name) in providers {
-                                if ui.selectable_label(current_provider == id, name).clicked() {
-                                    self.navigate(Nav::Provider(id));
-                                }
-                            }
-                            ui.add_space(10.0);
-                            section_title(ui, "Bot", "新建", || Nav::NewBot, self);
-                            for (id, name) in &bots {
-                                if ui.selectable_label(current_bot == *id, name).clicked() {
-                                    self.navigate(Nav::Bot(id.clone()));
-                                }
-                            }
-                            ui.add_space(10.0);
-                            ui.strong("聊天");
-                            if bots.is_empty() {
-                                ui.label(egui::RichText::new("保存一个 Bot 后可以在这里聊天").size(12.0).color(MUTED));
-                            }
-                            for (id, name) in bots {
-                                if ui.selectable_label(current_chat == id, name).clicked() {
-                                    self.navigate(Nav::Chat(id));
-                                }
-                            }
-                            ui.add_space(10.0);
-                            section_title(ui, "群组", "新建", || Nav::NewGroup, self);
-                            if groups.is_empty() {
-                                ui.label(egui::RichText::new("点「新建」开始一个群组").size(12.0).color(MUTED));
-                            }
-                            for (id, name) in groups {
-                                if ui.selectable_label(current_group == id, name).clicked() {
-                                    self.navigate(Nav::Group(id));
-                                }
-                            }
-                        });
-                    });
-                });
-            });
-    }
-
-    fn main_view(&mut self, ui: &mut egui::Ui) {
-        self.show_notice(ui);
-        if self.dirty() {
-            ui.label(egui::RichText::new("有未保存的修改").color(WARN));
+    fn editor(&mut self, ui: &mut egui::Ui, talking: bool) {
+        let tabs = self.tabs();
+        let mut chat_setup = false;
+        let mut chat_remove = false;
+        let in_chat = self.panel == Panel::Chat && !self.chat_id.is_empty() && self.view == View::Main;
+        let event = tab_strip(ui, &tabs, self.view, |ui| {
+            if in_chat {
+                chat_remove = bar_action(ui, "删除对话");
+                chat_setup = bar_action(ui, "配置 Bot");
+            }
+        });
+        match event {
+            Some(TabEvent::Select(view)) => self.view = view,
+            Some(TabEvent::Close(View::Browse)) => {
+                self.browse_file.clear();
+                self.browse_text.clear();
+            }
+            Some(TabEvent::Close(View::Attach)) => {
+                self.preview_id.clear();
+                self.preview_text.clear();
+            }
+            Some(TabEvent::Close(_)) | None => {}
         }
-        match self.panel {
-            Panel::Home => self.show_home(ui),
-            Panel::Provider => self.show_provider(ui),
-            Panel::Bot => self.show_bot(ui),
-            Panel::Chat => self.show_chat(ui),
-            Panel::Group => self.show_group(ui),
+        if chat_setup {
+            self.navigate(Nav::Bot(self.chat_id.clone()));
+            return;
+        }
+        if chat_remove {
+            if self.chat_job(&self.chat_id) {
+                self.set_err("这个对话还在回复");
+            } else {
+                self.confirm = Some(Confirm::Chat(self.chat_id.clone()));
+            }
+        }
+        self.fix_view();
+        if talking && self.view == View::Main {
+            self.composer(ui);
+        }
+        match (self.panel, self.view) {
+            (Panel::Home, _) => self.show_home(ui),
+            (Panel::Provider, _) => self.show_provider(ui),
+            (Panel::Bot, _) => self.show_bot(ui),
+            (Panel::Chat | Panel::Group, View::Browse) => {
+                let title = self.browse_file.clone();
+                let body = self.browse_text.clone();
+                show_preview(ui, &title, &body);
+            }
+            (Panel::Group, View::Attach) => {
+                let title = self.group_files.iter().find(|file| file.id == self.preview_id).map(|file| file.name.clone()).unwrap_or_default();
+                let body = self.preview_text.clone();
+                show_preview(ui, &title, &body);
+            }
+            (Panel::Group, View::Settings) => self.show_group_settings(ui),
+            (Panel::Chat, _) => self.show_chat(ui),
+            (Panel::Group, _) => self.show_group(ui),
         }
     }
 
-    fn show_home(&self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.heading("开始");
-        ui.add_space(6.0);
-        ui.label("1. 在左侧添加模型提供方。云端接口填写密钥，本地模型选 Ollama 或兼容地址。用途可以是对话、生图、语音或视频。");
-        ui.label("2. 新建 Bot，写下名字和提示词。");
-        ui.label("3. 在左侧「聊天」里选择一个 Bot，开始对话。");
-        ui.label("4. 在左侧「群组」里新建群组，加入 Bot，然后在群里说话。右侧可以放入文件并浏览。");
+    fn tabs(&self) -> Vec<Tab> {
+        let main = |label: String, dirty: bool| Tab { label, view: View::Main, dirty, closable: false };
+        let mut tabs = match self.panel {
+            Panel::Home => vec![main("欢迎".into(), false)],
+            Panel::Provider => vec![main(
+                if self.provider_form.id.is_empty() { "新的提供方".into() } else { tab_label(&self.provider_base.name, "提供方") },
+                self.dirty(),
+            )],
+            Panel::Bot => vec![main(
+                if self.bot_form.id.is_empty() { "新的 Bot".into() } else { tab_label(&self.bot_base.name, "Bot") },
+                self.dirty(),
+            )],
+            Panel::Chat => vec![main(self.bot_label(&self.chat_id), false)],
+            Panel::Group => vec![
+                main(tab_label(&self.group_name_base, "群组"), false),
+                Tab { label: "设置".into(), view: View::Settings, dirty: self.dirty(), closable: false },
+            ],
+        };
+        if matches!(self.panel, Panel::Chat | Panel::Group) && !self.browse_file.is_empty() {
+            let name = self.browse_file.rsplit('/').next().unwrap_or(&self.browse_file).to_string();
+            tabs.push(Tab { label: name, view: View::Browse, dirty: false, closable: true });
+        }
+        if self.in_group() && !self.preview_id.is_empty() {
+            if let Some(file) = self.group_files.iter().find(|file| file.id == self.preview_id) {
+                tabs.push(Tab { label: file.name.clone(), view: View::Attach, dirty: false, closable: true });
+            }
+        }
+        tabs
+    }
+
+    fn show_home(&mut self, ui: &mut egui::Ui) {
+        let mut nav = None;
+        page(ui, "home", |ui| {
+            ui.add_space(24.0);
+            ui.label(egui::RichText::new("本机 Bot").size(30.0).color(BRIGHT));
+            ui.label(egui::RichText::new("即开即用，只保存在这台电脑上").size(15.0).color(MUTED));
+            ui.add_space(28.0);
+            ui.label(egui::RichText::new("启动").size(16.0).color(BRIGHT));
+            ui.add_space(4.0);
+            for (text, target) in [
+                ("添加模型提供方…", Nav::NewProvider),
+                ("新建 Bot…", Nav::NewBot),
+                ("新建群组…", Nav::NewGroup),
+            ] {
+                if ui.link(egui::RichText::new(text).size(14.0)).clicked() {
+                    nav = Some(target);
+                }
+            }
+            ui.add_space(24.0);
+            ui.label(egui::RichText::new("步骤").size(16.0).color(BRIGHT));
+            ui.add_space(4.0);
+            for line in [
+                "1. 在左侧「模型提供方」里添加提供方。云端接口填写密钥，本地模型选 Ollama 或兼容地址。用途可以是对话、生图、语音或视频。",
+                "2. 在左侧「Bot」里新建 Bot，写下名字和提示词。",
+                "3. 在左侧「会话」的「单聊」里选择一个 Bot，开始对话。",
+                "4. 在「会话」的「群组」里新建群组，到「设置」标签加入 Bot，然后在群里说话。文件在左侧「资源管理器」里放入和浏览。",
+            ] {
+                ui.add(egui::Label::new(egui::RichText::new(line).color(TEXT)).wrap());
+            }
+        });
+        if let Some(nav) = nav {
+            self.navigate(nav);
+        }
     }
 
     fn show_provider(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("provider-form")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                self.provider_form_body(ui);
-            });
+        page(ui, "provider-form", |ui| self.provider_form_body(ui));
     }
 
     fn provider_form_body(&mut self, ui: &mut egui::Ui) {
         ui.heading(if self.provider_form.id.is_empty() { "添加模型提供方" } else { "编辑模型提供方" });
+        self.form_buttons(ui, true);
+        group_title(ui, "常规");
         field(ui, "名称", &mut self.provider_form.name, false, "例如：我的 DeepSeek");
         let previous = self.provider_form.kind.clone();
         let mut kind = previous.clone();
-        ui.label("接口类型");
+        setting_label(ui, "接口类型");
         egui::ComboBox::from_id_salt("provider-kind")
             .selected_text(providers::kind_label(&kind))
             .width(ui.available_width())
@@ -585,7 +604,7 @@ impl App {
             self.provider_form.task.clone()
         };
         let task_before = picked_task.clone();
-        ui.label("用途");
+        setting_label(ui, "用途");
         egui::ComboBox::from_id_salt("provider-task")
             .selected_text(providers::task_label(&picked_task))
             .width(ui.available_width())
@@ -601,11 +620,13 @@ impl App {
             ui.label(egui::RichText::new("这个接口只能对话").size(12.0).color(WARN));
         }
         self.preset_buttons(ui);
+        group_title(ui, "连接");
         field(ui, "接口地址", &mut self.provider_form.base_url, false, "https://");
         if self.provider_form.base_url.contains("example.openai.azure.com") {
             ui.label(egui::RichText::new("把地址改成你的资源，例如 https://my-name.openai.azure.com").size(12.0).color(MUTED));
         }
         field(ui, "API 密钥", &mut self.provider_form.api_key, true, "本地服务通常不用填");
+        group_title(ui, "模型");
         let model_label = if self.provider_form.kind == "azure" { "部署名" } else { "默认模型" };
         field(ui, model_label, &mut self.provider_form.model, false, "可稍后从模型列表选择");
         let task = providers::task_of(&self.provider_form.task).unwrap_or("chat");
@@ -624,12 +645,26 @@ impl App {
         if self.provider_form.kind == "azure" {
             field(ui, "API 版本", &mut self.provider_form.api_version, false, "2024-10-21");
         }
-        self.form_buttons(ui, true);
         self.model_chips(ui);
     }
 
     fn show_bot(&mut self, ui: &mut egui::Ui) {
+        page(ui, "bot-form", |ui| self.bot_form_body(ui));
+    }
+
+    fn bot_form_body(&mut self, ui: &mut egui::Ui) {
         ui.heading(if self.bot_form.id.is_empty() { "新建 Bot" } else { "Bot" });
+        self.form_buttons(ui, false);
+        if self.bot_form.id.is_empty() {
+            note(ui, "保存后，到左侧「会话」的「单聊」里选择这个 Bot。");
+        } else {
+            let chat_id = self.bot_form.id.clone();
+            if ui.link("和这个 Bot 聊天").clicked() {
+                self.navigate(Nav::Chat(chat_id));
+                return;
+            }
+        }
+        group_title(ui, "常规");
         field(ui, "名字", &mut self.bot_form.name, false, "例如：日程助手");
         let options = self
             .providers
@@ -647,7 +682,8 @@ impl App {
                     "提供方已删除".to_string()
                 }
             });
-        ui.label("模型提供方");
+        group_title(ui, "模型");
+        setting_label(ui, "模型提供方");
         let mut selected = self.bot_form.provider_id.clone();
         egui::ComboBox::from_id_salt("bot-provider")
             .selected_text(current)
@@ -673,9 +709,9 @@ impl App {
             (task, voice)
         });
         if let Some((task, voice)) = usage {
-            ui.label(egui::RichText::new(format!("用途：{task}")).size(12.0).color(MUTED));
+            note(ui, &format!("用途：{task}"));
             if let Some(voice) = voice {
-                ui.label(egui::RichText::new(format!("语音角色：{voice}")).size(12.0).color(MUTED));
+                note(ui, &format!("语音角色：{voice}"));
             }
         }
         let hint = options
@@ -699,10 +735,10 @@ impl App {
         if choices.is_empty() {
             field(ui, "模型", &mut self.bot_form.model, false, "留空则使用提供方的默认模型");
             if !self.bot_form.provider_id.is_empty() {
-                ui.label(egui::RichText::new("先在这个提供方里点「读取模型」，这里就能选择").size(12.0).color(MUTED));
+                note(ui, "先在这个提供方里点「读取模型」，这里就能选择");
             }
         } else {
-            ui.label("模型");
+            setting_label(ui, "模型");
             let mut picked = self.bot_form.model.clone();
             let shown = if picked.is_empty() { hint.clone() } else { picked.clone() };
             egui::ComboBox::from_id_salt("bot-model")
@@ -716,25 +752,18 @@ impl App {
                 });
             self.bot_form.model = picked;
         }
-        ui.label("系统提示词");
+        group_title(ui, "提示词");
+        setting_label(ui, "系统提示词");
         ui.add(
             egui::TextEdit::multiline(&mut self.bot_form.prompt)
-                .desired_rows(4)
+                .desired_rows(8)
                 .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(8, 6))
                 .hint_text("这个 Bot 的职责、语气和限制"),
         );
+        group_title(ui, "文件夹");
         folder_field(ui, &mut self.bot_form.folder, "选择 Bot 的文件夹");
-        ui.label(egui::RichText::new("保存后，单聊时这个 Bot 会读取这个文件夹，也可以把内容写进去。读到的文本会发给模型").size(12.0).color(MUTED));
-        self.form_buttons(ui, false);
-        ui.add_space(8.0);
-        if self.bot_form.id.is_empty() {
-            ui.label("保存后，到左侧「聊天」里选择这个 Bot。");
-            return;
-        }
-        let chat_id = self.bot_form.id.clone();
-        if ui.button("和这个 Bot 聊天").clicked() {
-            self.navigate(Nav::Chat(chat_id));
-        }
+        note(ui, "保存后，单聊时这个 Bot 会读取这个文件夹，也可以把内容写进去。读到的文本会发给模型");
     }
 
     fn show_chat(&mut self, ui: &mut egui::Ui) {
@@ -744,36 +773,7 @@ impl App {
             .find(|item| item.id == self.chat_id)
             .map(|item| item.name.clone())
             .unwrap_or_else(|| "Bot".to_string());
-        let mut remove = false;
-        ui.horizontal(|ui| {
-            ui.heading(format!("与 {name} 对话"));
-            if ui.button("删除对话").clicked() {
-                remove = true;
-            }
-        });
-        ui.label(egui::RichText::new("Bot 的名字和提示词在左侧单独配置").size(12.0).color(MUTED));
-        if remove {
-            if self.chat_job(&self.chat_id) {
-                self.set_err("这个对话还在回复");
-            } else {
-                self.confirm = Some(Confirm::Chat(self.chat_id.clone()));
-            }
-        }
-        ui.add_space(6.0);
-        let frame = egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(244, 244, 245))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(10.0);
-        frame.show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    self.show_messages(ui, &name);
-                });
-        });
+        message_area(ui, "chat-messages", |ui| self.show_messages(ui, &name));
     }
 
     fn show_messages(&mut self, ui: &mut egui::Ui, bot_name: &str) {
@@ -814,25 +814,33 @@ impl App {
     }
 
     fn show_group(&mut self, ui: &mut egui::Ui) {
-        ui.heading("群组");
-        ui.label(egui::RichText::new("你的话会先记下来，Bot 再按加入顺序一个一个回复").size(12.0).color(MUTED));
-        field(ui, "名字", &mut self.group_name, false, "例如：项目讨论");
-        folder_field(ui, &mut self.group_folder, "选择群组的文件夹");
-        ui.label(egui::RichText::new("保存后，群里的 Bot 会读取这个文件夹，也可以把内容写进去。读到的文本会发给模型").size(12.0).color(MUTED));
+        message_area(ui, "group-messages", |ui| self.show_group_messages(ui));
+    }
+
+    fn show_group_settings(&mut self, ui: &mut egui::Ui) {
+        page(ui, "group-settings", |ui| self.group_settings_body(ui));
+    }
+
+    fn group_settings_body(&mut self, ui: &mut egui::Ui) {
+        ui.heading("群组设置");
+        note(ui, "你的话会先记下来，Bot 再按加入顺序一个一个回复");
         let mut save = false;
         let mut cancel = false;
         let mut remove = false;
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("保存").clicked() {
-                save = true;
-            }
+            save = primary_button(ui, "保存", true);
             if ui.button("取消").clicked() {
                 cancel = true;
             }
-            if ui.button("删除").clicked() {
+            if ui.button("删除群组").clicked() {
                 remove = true;
             }
         });
+        group_title(ui, "常规");
+        field(ui, "名字", &mut self.group_name, false, "例如：项目讨论");
+        folder_field(ui, &mut self.group_folder, "选择群组的文件夹");
+        note(ui, "保存后，群里的 Bot 会读取这个文件夹，也可以把内容写进去。读到的文本会发给模型");
         if save {
             match self.save_group() {
                 Ok(()) => self.set_ok("已保存"),
@@ -867,30 +875,36 @@ impl App {
         if !choices.iter().any(|(id, _)| id == &self.join_bot) {
             self.join_bot.clear();
         }
-        ui.add_space(4.0);
-        ui.label("成员");
+        group_title(ui, &format!("成员（{} / 12）", member_ids.len()));
         if member_ids.is_empty() {
-            ui.label(egui::RichText::new("还没有 Bot").size(12.0).color(MUTED));
+            note(ui, "还没有 Bot");
         }
         let mut kick = None;
-        egui::ScrollArea::vertical()
-            .id_salt("group-members")
-            .max_height(132.0)
-            .show(ui, |ui| {
-                for id in &member_ids {
-                    let name = self.bot_label(id);
+        for (index, id) in member_ids.iter().enumerate() {
+            let name = self.bot_label(id);
+            egui::Frame::NONE
+                .fill(CARD)
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(&name);
-                        if ui.small_button("踢出").clicked() {
-                            kick = Some(id.clone());
-                        }
+                        ui.label(egui::RichText::new(format!("{}", index + 1)).color(MUTED));
+                        ui.label(egui::RichText::new(&name).color(TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("踢出").clicked() {
+                                kick = Some(id.clone());
+                            }
+                        });
                     });
-                }
-            });
+                });
+        }
+        ui.add_space(4.0);
         if self.bots.is_empty() {
-            ui.label(egui::RichText::new("先保存一个 Bot，才能加入群组").size(12.0).color(MUTED));
+            note(ui, "先保存一个 Bot，才能加入群组");
         } else if choices.is_empty() {
-            ui.label(egui::RichText::new("保存的 Bot 都已经在群里").size(12.0).color(MUTED));
+            note(ui, "保存的 Bot 都已经在群里");
         } else {
             let mut selected = self.join_bot.clone();
             let shown = choices
@@ -917,29 +931,17 @@ impl App {
         if let Some(bot_id) = kick {
             self.kick_bot(&bot_id);
         }
-
-        ui.add_space(6.0);
-        let frame = egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(244, 244, 245))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(10.0);
-        frame.show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    self.show_group_messages(ui);
-                });
-        });
     }
 
     fn show_group_messages(&mut self, ui: &mut egui::Ui) {
         if self.group_messages.is_empty() && self.group_speaker().is_none() {
             ui.add_space(24.0);
+            let empty = self.groups.iter().find(|group| group.id == self.group_id).map_or(true, |group| group.bot_ids.is_empty());
             ui.vertical_centered(|ui| {
                 ui.label(egui::RichText::new("从下面的输入框开始说话").color(MUTED));
+                if empty {
+                    ui.label(egui::RichText::new("群里还没有 Bot，到「设置」标签里加入").color(MUTED));
+                }
             });
         }
         let rows: Vec<(String, String, String, String, u64, u64)> = self
@@ -1051,63 +1053,7 @@ impl App {
         }
     }
 
-    fn files_panel(&mut self, ctx: &egui::Context) {
-        let files = self.group_files.clone();
-        let preview_id = self.preview_id.clone();
-        let preview_text = self.preview_text.clone();
-        let folder = self.group_folder_base.clone();
-        let frame = egui::Frame::NONE.fill(egui::Color32::WHITE).inner_margin(12.0);
-        egui::SidePanel::right("group-files")
-            .exact_width(300.0)
-            .resizable(false)
-            .frame(frame)
-            .show(ctx, |ui| {
-                if !folder.is_empty() {
-                    self.folder_browser(ui, &folder);
-                    ui.separator();
-                }
-                ui.strong("文件");
-                if ui.button("放入文件").clicked() {
-                    self.import_group_file();
-                }
-                ui.label(egui::RichText::new("只保存在这台电脑上，不会发给模型").size(11.0).color(MUTED));
-                egui::ScrollArea::vertical()
-                    .id_salt("group-file-list")
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        if files.is_empty() {
-                            ui.label(egui::RichText::new("还没有文件").size(12.0).color(MUTED));
-                        }
-                        for file in &files {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("移除").clicked() {
-                                    self.remove_group_file(&file.id);
-                                }
-                                let label = format!("{}  {}", file.name, size_label(file.size));
-                                if ui.selectable_label(preview_id == file.id, label).clicked() {
-                                    self.open_group_file(&file.id);
-                                }
-                            });
-                        }
-                    });
-                ui.separator();
-                ui.strong("浏览");
-                if preview_id.is_empty() {
-                    ui.label(egui::RichText::new("点文件名查看内容").size(12.0).color(MUTED));
-                    return;
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt("group-file-preview")
-                    .auto_shrink([false, false])
-                    .max_height(ui.available_height())
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.label(egui::RichText::new(&preview_text).size(13.0).color(TEXT));
-                    });
-            });
-    }
-
-    fn composer(&mut self, ctx: &egui::Context) {
+    fn composer(&mut self, ui: &mut egui::Ui) {
         let mut send = false;
         let busy = self.job.is_some();
         let focus = self.focus_input;
@@ -1123,29 +1069,42 @@ impl App {
             }
             .to_string()
         };
-        let frame = egui::Frame::NONE.fill(egui::Color32::WHITE).inner_margin(12.0);
-        egui::TopBottomPanel::bottom("composer").frame(frame).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let width = (ui.available_width() - 88.0).max(120.0);
-                let edit = egui::TextEdit::singleline(&mut self.input)
-                    .id(egui::Id::new("composer-input"))
-                    .desired_width(width)
-                    .hint_text(hint);
-                let response = ui.add_enabled(!busy, edit);
-                if focus {
-                    response.request_focus();
-                }
-                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                    send = true;
-                }
-                let can_send = !busy && !self.input.trim().is_empty();
-                let button = egui::Button::new(egui::RichText::new("发送").color(egui::Color32::WHITE))
-                    .fill(USER_BUBBLE);
-                if ui.add_enabled(can_send, button).clicked() {
-                    send = true;
-                }
+        let outer = egui::Frame::NONE.fill(EDITOR_BG).inner_margin(egui::Margin { left: 20, right: 20, top: 8, bottom: 14 });
+        egui::TopBottomPanel::bottom("composer")
+            .frame(outer)
+            .show_separator_line(false)
+            .show_inside(ui, |ui| {
+                let focused = ui.memory(|memory| memory.has_focus(egui::Id::new("composer-input")));
+                egui::Frame::NONE
+                    .fill(INPUT_BG)
+                    .stroke(egui::Stroke::new(1.0_f32, if focused { ACCENT } else { INPUT_BORDER }))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - 72.0).max(120.0);
+                            let edit = egui::TextEdit::singleline(&mut self.input)
+                                .id(egui::Id::new("composer-input"))
+                                .frame(false)
+                                .font(egui::FontId::proportional(14.0))
+                                .desired_width(width)
+                                .hint_text(hint);
+                            let response = ui.add_enabled(!busy, edit);
+                            if focus {
+                                response.request_focus();
+                            }
+                            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                                send = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let can_send = !busy && !self.input.trim().is_empty();
+                                if primary_button(ui, "发送", can_send) {
+                                    send = true;
+                                }
+                            });
+                        });
+                    });
             });
-        });
         if focus {
             self.focus_input = false;
         }
@@ -1160,17 +1119,22 @@ impl App {
 
     fn preset_buttons(&mut self, ui: &mut egui::Ui) {
         let mut chosen: Option<&'static str> = None;
-        ui.label("预设");
-        for group in ["云端 API", "本地", "生图、语音、视频"] {
-            ui.label(egui::RichText::new(group).size(12.0).color(MUTED));
-            ui.horizontal_wrapped(|ui| {
-                for preset in providers::presets().iter().filter(|item| item.group == group) {
-                    if ui.small_button(preset.name).clicked() {
-                        chosen = Some(preset.name);
-                    }
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(egui::RichText::new("预设").color(BRIGHT))
+            .id_salt(("provider-presets", self.provider_form.id.clone()))
+            .default_open(self.provider_form.id.is_empty())
+            .show(ui, |ui| {
+                for group in ["云端 API", "本地", "生图、语音、视频"] {
+                    note(ui, group);
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in providers::presets().iter().filter(|item| item.group == group) {
+                            if ui.small_button(preset.name).clicked() {
+                                chosen = Some(preset.name);
+                            }
+                        }
+                    });
                 }
             });
-        }
         if let Some(name) = chosen {
             if let Some(preset) = providers::presets().iter().find(|item| item.name == name) {
                 providers::apply_preset(&mut self.provider_form, preset);
@@ -1193,7 +1157,7 @@ impl App {
             !self.bot_form.id.is_empty()
         };
         ui.horizontal_wrapped(|ui| {
-            if ui.button("保存").clicked() {
+            if primary_button(ui, "保存", true) {
                 save = true;
             }
             if provider && ui.add_enabled(!busy, egui::Button::new("测试连接")).clicked() {
@@ -1237,19 +1201,26 @@ impl App {
         if self.models.is_empty() {
             return;
         }
-        ui.label(egui::RichText::new("模型列表").size(12.0).color(MUTED));
         let models = self.models.iter().take(40).cloned().collect::<Vec<_>>();
+        let total = self.models.len();
         let mut picked = None;
-        ui.horizontal_wrapped(|ui| {
-            for model in &models {
-                if ui.small_button(model).clicked() {
-                    picked = Some(model.clone());
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(egui::RichText::new(format!("模型列表（{total}）")).color(BRIGHT))
+            .id_salt(("provider-models", self.provider_form.id.clone()))
+            .default_open(true)
+            .show(ui, |ui| {
+                note(ui, "点一个模型名，填入默认模型");
+                ui.horizontal_wrapped(|ui| {
+                    for model in &models {
+                        if ui.small_button(model).clicked() {
+                            picked = Some(model.clone());
+                        }
+                    }
+                });
+                if total > models.len() {
+                    note(ui, &format!("还有 {} 个未显示", total - models.len()));
                 }
-            }
-        });
-        if self.models.len() > models.len() {
-            ui.label(egui::RichText::new(format!("还有 {} 个未显示", self.models.len() - models.len())).size(12.0).color(MUTED));
-        }
+            });
         if let Some(model) = picked {
             self.provider_form.model = model;
         }
@@ -1272,8 +1243,9 @@ impl App {
                     Confirm::Group(_) => "删除这个群组、里面的对话和放入的文件？指定的文件夹不会删除。",
                     Confirm::Chat(_) => "删除和这个 Bot 的全部对话？记录会从本机去掉，Bot 还在。",
                 });
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("删除").clicked() {
+                    if danger_button(ui, "删除") {
                         self.perform_delete(&confirm);
                     }
                     if ui.button("取消").clicked() {
@@ -1363,6 +1335,13 @@ impl App {
         }
         self.clear_notice();
         self.models.clear();
+        self.view = View::Main;
+        self.activity = match nav {
+            Nav::NewProvider | Nav::Provider(_) => Activity::Providers,
+            Nav::NewBot | Nav::Bot(_) => Activity::Bots,
+            Nav::Chat(_) | Nav::Group(_) | Nav::NewGroup if self.activity == Activity::Explorer => Activity::Explorer,
+            Nav::Chat(_) | Nav::Group(_) | Nav::NewGroup => Activity::Talk,
+        };
         match nav {
             Nav::NewProvider => {
                 let draft = Provider::draft("openai");
@@ -1535,22 +1514,16 @@ impl App {
         matches!(&self.job, Some(Job::Chat { bot_id, .. }) if bot_id == id)
     }
 
-    fn show_notice(&self, ui: &mut egui::Ui) {
-        if self.notice.is_empty() {
-            return;
-        }
-        let color = if self.notice_ok { OK } else { DANGER };
-        ui.label(egui::RichText::new(&self.notice).color(color));
-    }
-
     fn set_err(&mut self, text: impl Into<String>) {
         self.notice = text.into();
         self.notice_ok = false;
+        self.mark_notice();
     }
 
     fn set_ok(&mut self, text: impl Into<String>) {
         self.notice = text.into();
         self.notice_ok = true;
+        self.mark_notice();
     }
 
     fn clear_notice(&mut self) {
@@ -1607,6 +1580,7 @@ impl App {
         self.input.clear();
         self.focus_input = true;
         self.panel = Panel::Group;
+        self.view = View::Main;
         if let Some(err) = error {
             self.set_err(err);
         }
@@ -1706,6 +1680,7 @@ impl App {
             Ok(group::Preview::Binary) => {
                 self.preview_id = file_id.to_string();
                 self.preview_text = "这个文件不是文本，不能在窗口里显示。".into();
+                self.view = View::Attach;
             }
             Ok(group::Preview::Text { body, truncated }) => {
                 self.preview_id = file_id.to_string();
@@ -1716,6 +1691,7 @@ impl App {
                 } else {
                     body
                 };
+                self.view = View::Attach;
             }
             Err(err) => self.set_err(err),
         }
@@ -1744,129 +1720,6 @@ impl App {
             .find(|item| item.id == self.chat_id)
             .map(|item| item.folder.clone())
             .filter(|folder| !folder.trim().is_empty())
-    }
-
-    fn chat_folder_panel(&mut self, ctx: &egui::Context) {
-        let Some(root) = self.chat_folder() else {
-            return;
-        };
-        let frame = egui::Frame::NONE.fill(egui::Color32::WHITE).inner_margin(12.0);
-        egui::SidePanel::right("chat-folder")
-            .exact_width(300.0)
-            .resizable(false)
-            .frame(frame)
-            .show(ctx, |ui| {
-                self.folder_browser(ui, &root);
-            });
-    }
-
-    fn folder_browser(&mut self, ui: &mut egui::Ui, root: &str) {
-        let dir = self.browse_dir.clone();
-        let entries = self.browse_entries.clone();
-        let truncated = self.browse_truncated;
-        let error = self.browse_error.clone();
-        let current = self.browse_file.clone();
-        let preview = self.browse_text.clone();
-        let mut up = false;
-        let mut open_dir = None;
-        let mut open_file = None;
-        let mut write = false;
-        let mut import = false;
-        ui.strong("文件夹");
-        ui.label(egui::RichText::new(root).size(11.0).color(MUTED));
-        ui.horizontal(|ui| {
-            if !dir.is_empty() && ui.button("上级").clicked() {
-                up = true;
-            }
-            let here = if dir.is_empty() { "当前文件夹".to_string() } else { dir.clone() };
-            ui.label(egui::RichText::new(here).size(12.0).color(MUTED));
-        });
-        if !error.is_empty() {
-            ui.label(egui::RichText::new(&error).size(12.0).color(DANGER));
-        }
-        egui::ScrollArea::vertical()
-            .id_salt("folder-list")
-            .max_height(180.0)
-            .show(ui, |ui| {
-                if entries.is_empty() && error.is_empty() {
-                    ui.label(egui::RichText::new("这个文件夹是空的").size(12.0).color(MUTED));
-                }
-                for entry in &entries {
-                    let label = if entry.dir {
-                        format!("{}/", entry.name)
-                    } else {
-                        format!("{}  {}", entry.name, size_label(entry.size))
-                    };
-                    let path = join_rel(&dir, &entry.name);
-                    let selected = !entry.dir && current == path;
-                    if ui.selectable_label(selected, label).clicked() {
-                        if entry.dir {
-                            open_dir = Some(entry.name.clone());
-                        } else {
-                            open_file = Some(path);
-                        }
-                    }
-                }
-                if truncated {
-                    ui.label(egui::RichText::new("还有更多，未列出").size(12.0).color(MUTED));
-                }
-            });
-        ui.separator();
-        ui.strong("读取");
-        if current.is_empty() {
-            ui.label(egui::RichText::new("点文件名查看内容，点文件夹名进入").size(12.0).color(MUTED));
-        } else {
-            ui.label(egui::RichText::new(&current).size(11.0).color(MUTED));
-            egui::ScrollArea::vertical()
-                .id_salt("folder-preview")
-                .max_height(140.0)
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new(&preview).size(13.0).color(TEXT));
-                });
-        }
-        ui.separator();
-        ui.strong("写入");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.browse_name)
-                .desired_width(f32::INFINITY)
-                .hint_text("文件名，例如 笔记.txt"),
-        );
-        ui.add(
-            egui::TextEdit::multiline(&mut self.browse_body)
-                .desired_rows(4)
-                .desired_width(f32::INFINITY)
-                .hint_text("文本内容"),
-        );
-        ui.horizontal(|ui| {
-            if ui.button("写入").clicked() {
-                write = true;
-            }
-            if ui.button("放入文件").clicked() {
-                import = true;
-            }
-        });
-        ui.label(egui::RichText::new("写在当前打开的文件夹里。对话时 Bot 也会读取和写入这里").size(11.0).color(MUTED));
-        if up {
-            self.browse_dir = parent_rel(&dir);
-            self.browse_file.clear();
-            self.browse_text.clear();
-            self.reload_browse(root);
-        }
-        if let Some(name) = open_dir {
-            self.browse_dir = join_rel(&dir, &name);
-            self.browse_file.clear();
-            self.browse_text.clear();
-            self.reload_browse(root);
-        }
-        if let Some(path) = open_file {
-            self.open_browse(root, &path);
-        }
-        if write {
-            self.write_browse(root);
-        }
-        if import {
-            self.import_browse(root);
-        }
     }
 
     fn reset_browse(&mut self) {
@@ -1906,6 +1759,7 @@ impl App {
             Ok(folder::Preview::Binary) => {
                 self.browse_file = path.to_string();
                 self.browse_text = "这个文件不是文本，不能在窗口里显示。".into();
+                self.view = View::Browse;
             }
             Ok(folder::Preview::Text { body, truncated }) => {
                 self.browse_file = path.to_string();
@@ -1916,6 +1770,7 @@ impl App {
                 } else {
                     body
                 };
+                self.view = View::Browse;
             }
             Err(err) => self.set_err(err),
         }
@@ -1969,17 +1824,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_frame(ctx);
     }
-}
 
-fn section_title(ui: &mut egui::Ui, title: &str, action: &str, nav: impl FnOnce() -> Nav, app: &mut App) {
-    ui.horizontal(|ui| {
-        ui.strong(title);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button(action).clicked() {
-                app.navigate(nav());
-            }
-        });
-    });
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::from(shell::SIDE_BG).to_array()
+    }
 }
 
 fn join_rel(dir: &str, name: &str) -> String {
@@ -1998,12 +1846,13 @@ fn parent_rel(dir: &str) -> String {
 }
 
 fn folder_field(ui: &mut egui::Ui, text: &mut String, title: &str) {
-    ui.label("文件夹");
+    setting_label(ui, "文件夹");
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 72.0).max(120.0);
         ui.add(
             egui::TextEdit::singleline(text)
                 .desired_width(width)
+                .margin(egui::Margin::symmetric(8, 5))
                 .hint_text("绝对路径，留空则不浏览"),
         );
         if ui.button("选择").clicked() {
@@ -2012,13 +1861,19 @@ fn folder_field(ui: &mut egui::Ui, text: &mut String, title: &str) {
             }
         }
     });
-    ui.label(egui::RichText::new("点「选择」后，在树里点一下文件夹，再点确定。").size(12.0).color(MUTED));
+    note(ui, "点「选择」后，在树里点一下文件夹，再点确定。");
+}
+
+fn setting_label(ui: &mut egui::Ui, label: &str) {
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(label).color(BRIGHT));
 }
 
 fn field(ui: &mut egui::Ui, label: &str, text: &mut String, password: bool, hint: &str) {
-    ui.label(label);
+    setting_label(ui, label);
     let mut edit = egui::TextEdit::singleline(text)
         .desired_width(f32::INFINITY)
+        .margin(egui::Margin::symmetric(8, 5))
         .hint_text(hint);
     if password {
         edit = edit.password(true);
@@ -2026,8 +1881,37 @@ fn field(ui: &mut egui::Ui, label: &str, text: &mut String, password: bool, hint
     ui.add(edit);
 }
 
+/// 对话记录区：占满编辑区，新消息贴在底部。
+fn message_area(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 8 }).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                add(ui);
+            });
+        });
+}
+
+/// 文件预览标签：上面是路径，下面是等宽正文。
+fn show_preview(ui: &mut egui::Ui, title: &str, body: &str) {
+    egui::Frame::NONE.inner_margin(egui::Margin { left: 20, right: 20, top: 6, bottom: 6 }).show(ui, |ui| {
+        ui.label(egui::RichText::new(title).size(12.0).color(MUTED));
+    });
+    egui::ScrollArea::both()
+        .id_salt(("preview", title))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Frame::NONE.inner_margin(egui::Margin { left: 20, right: 20, top: 0, bottom: 16 }).show(ui, |ui| {
+                ui.label(egui::RichText::new(body).monospace().size(13.0).color(TEXT));
+            });
+        });
+}
+
 fn bubble(ui: &mut egui::Ui, caption: Option<&str>, text: &str, mine: bool, extra: impl FnOnce(&mut egui::Ui)) {
-    let max_width = (ui.available_width() * 0.72).clamp(200.0, 560.0);
+    let max_width = (ui.available_width() * 0.75).clamp(200.0, 760.0);
     let layout = if mine {
         egui::Layout::right_to_left(egui::Align::Min)
     } else {
@@ -2040,22 +1924,18 @@ fn bubble(ui: &mut egui::Ui, caption: Option<&str>, text: &str, mine: bool, extr
     }
     ui.with_layout(layout, |ui| {
         let frame = egui::Frame::NONE
-            .fill(if mine { USER_BUBBLE } else { egui::Color32::WHITE })
+            .fill(if mine { USER_BUBBLE } else { CARD })
             .stroke(if mine {
                 egui::Stroke::NONE
             } else {
-                egui::Stroke::new(1.0_f32, LINE)
+                egui::Stroke::new(1.0_f32, BORDER)
             })
-            .corner_radius(egui::CornerRadius::same(16))
+            .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(12, 8));
         frame.show(ui, |ui| {
             ui.set_max_width(max_width);
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(text)
-                        .size(15.0)
-                        .color(if mine { egui::Color32::WHITE } else { TEXT }),
-                );
+                ui.label(egui::RichText::new(text).size(14.5).color(if mine { BRIGHT } else { TEXT }));
                 extra(ui);
             });
         });
@@ -2113,8 +1993,8 @@ fn size_label(size: u64) -> String {
 
 fn error_line(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
-        .fill(egui::Color32::from_rgb(254, 242, 242))
-        .corner_radius(egui::CornerRadius::same(10))
+        .fill(ERROR_BG)
+        .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).color(DANGER));
